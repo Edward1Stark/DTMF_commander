@@ -12,7 +12,7 @@ Connect a receiver walkie talkie to your computer's audio input using an AUX cab
 **Step 2: Install Dependencies**
 
 ```bash
-pip install pyaudio numpy scipy
+pip install -r requirements.txt
 ```
 
 **Step 3: Run the App**
