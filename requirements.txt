@@ -1,0 +1,8 @@
+# DTMF Commander v2 — Requirements
+# Install with:  pip install -r requirements.txt
+
+sounddevice>=0.4.6
+numpy>=1.21
+scipy>=1.7
+pyserial>=3.5
+Pillow>=9.0.0
