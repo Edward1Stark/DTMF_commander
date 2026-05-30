@@ -1,5 +1,5 @@
-![Alt text](Interface.png)
 # DTMF Commander
+![Alt text](Interface.png)
 
 **DTMF Commander** lets you control electronics remotely using a walkie talkie and DTMF tones. Press a button on your radio, and it triggers a serial command on your laptop or Raspberry Pi. No internet, no cellular, just radio.
 
