@@ -526,6 +526,9 @@ class CustomDialog(tk.Toplevel):
 # ═══════════════════════════════════════════════════════
 
 class RuleEditorDialog(CustomDialog):
+    # How often (ms) to re-scan for COM ports while the dialog is open
+    _PORT_POLL_MS = 1500
+
     def __init__(self, parent, on_save, existing_rule=None):
         title = "✦  EDIT RULE" if existing_rule else "✦  NEW RULE"
         super().__init__(parent, title, 800, 700)
@@ -551,28 +554,125 @@ class RuleEditorDialog(CustomDialog):
 
         self._vars = {}
 
-        fields = [
-            ("label",    "RULE LABEL",               rule.get("label", ""),       False),
-            ("password", "DTMF SEQUENCE  (password)", rule.get("password", ""),   False),
-            ("port",     "COM PORT  (e.g. COM3)",     rule.get("port", ""),        False),
-            ("command",  "COMMAND STRING",             rule.get("command", ""),    False),
+        # Fields that use a plain FlatEntry (port handled separately below)
+        plain_fields = [
+            ("label",    "RULE LABEL",               rule.get("label", ""),        False),
+            ("password", "DTMF SEQUENCE  (password)", rule.get("password", ""),    False),
+            ("command",  "COMMAND STRING",             rule.get("command", ""),     False),
             ("baud",     "BAUD RATE",                 str(rule.get("baud", 9600)), False),
         ]
 
-        for row_i, (key, lbl_text, default, secret) in enumerate(fields):
+        # We will insert the COM PORT row between password (row 1) and command (row 2)
+        # Layout rows: label=0/1, password=2/3, port=4/5/6, command=7/8 (hint is row 6),
+        # baud=9/10 — keep it tidy by building a row map.
+        row_map = [
+            (0, plain_fields[0]),   # label
+            (1, plain_fields[1]),   # password
+        ]
+
+        PORT_LABEL_ROW   = 4   # grid row for "COM PORT" label
+        PORT_WIDGET_ROW  = 5   # grid row for the dropdown
+        PORT_STATUS_ROW  = 6   # grid row for the live-status label
+
+        remaining_plain = [
+            (7,  plain_fields[2]),  # command
+            (9,  plain_fields[3]),  # baud
+        ]
+
+        for grid_label_row, (key, lbl_text, default, secret) in row_map:
             tk.Label(form, text=lbl_text, font=FONT_LABEL, bg=C["bg1"],
-                      fg=C["text2"]).grid(row=row_i*2, column=0, sticky="w",
-                                           pady=(8 if row_i else 0, 2))
+                      fg=C["text2"]).grid(row=grid_label_row*2, column=0, sticky="w",
+                                           pady=(0, 2))
             var = tk.StringVar(value=default)
             self._vars[key] = var
             kw = {"show": "●"} if secret else {}
             e = FlatEntry(form, textvariable=var, **kw)
-            e.grid(row=row_i*2+1, column=0, sticky="ew", ipady=6)
-            form.rowconfigure(row_i*2+1, weight=0)
+            e.grid(row=grid_label_row*2+1, column=0, sticky="ew", ipady=6)
+
+        # ── COM PORT — live-polling dropdown ──────────────────
+        tk.Label(form, text="COM PORT", font=FONT_LABEL, bg=C["bg1"],
+                  fg=C["text2"]).grid(row=PORT_LABEL_ROW, column=0, sticky="w",
+                                       pady=(8, 2))
+
+        self._port_var = tk.StringVar(value=rule.get("port", ""))
+        self._vars["port"] = self._port_var
+
+        # Initial port scan
+        self._last_ports = self._scan_ports()
+
+        # If saved port is not in detected list, still keep it selectable
+        initial_ports = list(self._last_ports)
+        saved_port    = rule.get("port", "")
+        if saved_port and saved_port not in initial_ports:
+            initial_ports.insert(0, saved_port)
+
+        # Build the dropdown (or a plain entry fallback when no ports detected)
+        port_row_frame = tk.Frame(form, bg=C["bg1"])
+        port_row_frame.grid(row=PORT_WIDGET_ROW, column=0, sticky="ew")
+        port_row_frame.columnconfigure(0, weight=1)
+
+        if initial_ports:
+            self._port_drop = FlatDropdown(port_row_frame, self._port_var, initial_ports)
+            self._port_drop.grid(row=0, column=0, sticky="ew")
+            # If saved port present in list, select it; else pick first available
+            if saved_port in initial_ports:
+                self._port_var.set(saved_port)
+            else:
+                self._port_var.set(initial_ports[0])
+            self._port_entry = None
+        else:
+            # No ports yet — show an entry so the user can type manually
+            self._port_entry = FlatEntry(port_row_frame, textvariable=self._port_var)
+            self._port_entry.grid(row=0, column=0, sticky="ew", ipady=6)
+            self._port_drop = None
+            if saved_port:
+                self._port_var.set(saved_port)
+
+        # Refresh button (small, to the right of the dropdown)
+        FlatButton(port_row_frame, "⟳", self._refresh_ports_now,
+                   variant="ghost2", width=3).grid(row=0, column=1, padx=(6, 0))
+
+        # Live status label (shows count + port names or a "no ports" message)
+        self._port_status_var = tk.StringVar()
+        self._port_status_lbl = tk.Label(
+            form,
+            textvariable=self._port_status_var,
+            font=FONT_LABEL, bg=C["bg1"], fg=C["text2"],
+            anchor="w",
+        )
+        self._port_status_lbl.grid(row=PORT_STATUS_ROW, column=0, sticky="w", pady=(2, 0))
+        self._update_port_status(self._last_ports)
+
+        # Remaining plain fields (command, baud)
+        for grid_label_row, (key, lbl_text, default, secret) in remaining_plain:
+            tk.Label(form, text=lbl_text, font=FONT_LABEL, bg=C["bg1"],
+                      fg=C["text2"]).grid(row=grid_label_row, column=0, sticky="w",
+                                           pady=(8, 2))
+            var = tk.StringVar(value=default)
+            self._vars[key] = var
+            kw = {"show": "●"} if secret else {}
+            e = FlatEntry(form, textvariable=var, **kw)
+            e.grid(row=grid_label_row+1, column=0, sticky="ew", ipady=6)
 
         form.columnconfigure(0, weight=1)
 
-        # COM port hint — scan engine + Linux fallback
+        # Start live polling
+        self._polling = True
+        self._poll_ports()
+
+        # ── Footer buttons ─────────────────────────────────────
+        sep(self, fill="x")
+        footer = tk.Frame(self, bg=C["bg1"])
+        footer.pack(fill="x", padx=24, pady=14)
+
+        FlatButton(footer, "CANCEL", self.destroy, variant="ghost").pack(side="right", padx=(6, 0))
+        FlatButton(footer, "SAVE RULE", self._save, variant="primary").pack(side="right")
+
+    # ── COM-port live detection helpers ───────────────────────
+
+    @staticmethod
+    def _scan_ports():
+        """Return a sorted list of available COM / serial port names."""
         ports = list(list_com_ports())
         if not ports and sys.platform.startswith("linux"):
             import glob as _glob
@@ -582,21 +682,123 @@ class RuleEditorDialog(CustomDialog):
                 _glob.glob("/dev/ttyS[0-9]*")
             )
             ports = sorted(linux_ports)
+        return ports
+
+    def _update_port_status(self, ports):
+        """Refresh the status label under the COM port widget."""
         if ports:
-            hint = "detected: " + "  ".join(ports)
+            if len(ports) == 1:
+                self._port_status_var.set(f"● 1 port detected: {ports[0]}")
+            else:
+                self._port_status_var.set(
+                    f"● {len(ports)} ports detected: " + "  ".join(ports)
+                )
+            self._port_status_lbl.configure(fg=C["text2"])
         else:
-            hint = ("no COM ports detected — on Linux check /dev/ttyUSB* or /dev/ttyACM*"
-                    " and run:  sudo usermod -aG dialout $USER")
-        tk.Label(form, text=hint, font=FONT_LABEL, bg=C["bg1"],
-                  fg=C["text2"]).grid(row=len(fields)*2, column=0, sticky="w", pady=(4, 0))
+            if sys.platform.startswith("linux"):
+                self._port_status_var.set(
+                    "○ no ports — check /dev/ttyUSB* or run: sudo usermod -aG dialout $USER"
+                )
+            else:
+                self._port_status_var.set("○ no COM ports detected")
+            self._port_status_lbl.configure(fg=C["red"])
 
-        # ── Footer buttons ─────────────────────────────────────
-        sep(self, fill="x")
-        footer = tk.Frame(self, bg=C["bg1"])
-        footer.pack(fill="x", padx=24, pady=14)
+    def _rebuild_port_widget(self, form_frame, ports):
+        """
+        Swap between FlatDropdown and FlatEntry depending on whether ports
+        are available.  Only rebuilds when the port list actually changes.
+        """
+        current_val = self._port_var.get()
 
-        FlatButton(footer, "CANCEL", self.destroy, variant="ghost").pack(side="right", padx=(6, 0))
-        FlatButton(footer, "SAVE RULE", self._save, variant="primary").pack(side="right")
+        if ports:
+            # Ensure the currently-typed value stays selectable if not detected
+            all_choices = list(ports)
+            if current_val and current_val not in all_choices:
+                all_choices.insert(0, current_val)
+
+            if self._port_drop is not None:
+                # Already a dropdown — just update its values
+                self._port_drop.update_values(all_choices)
+                # Restore selection: prefer currently selected → first detected port
+                if current_val in all_choices:
+                    self._port_var.set(current_val)
+                else:
+                    self._port_var.set(all_choices[0])
+            else:
+                # Was a plain entry — replace with dropdown
+                if self._port_entry:
+                    self._port_entry.destroy()
+                    self._port_entry = None
+                # Find the port_row_frame (column=0, row=PORT_WIDGET_ROW inside form)
+                for child in form_frame.grid_slaves(row=5, column=0):
+                    port_row_frame = child
+                    break
+                else:
+                    return
+                self._port_drop = FlatDropdown(port_row_frame, self._port_var, all_choices)
+                self._port_drop.grid(row=0, column=0, sticky="ew")
+                if current_val in all_choices:
+                    self._port_var.set(current_val)
+                else:
+                    self._port_var.set(all_choices[0])
+        else:
+            if self._port_drop is not None:
+                # No ports left — replace dropdown with plain entry
+                self._port_drop.destroy()
+                self._port_drop = None
+                for child in form_frame.grid_slaves(row=5, column=0):
+                    port_row_frame = child
+                    break
+                else:
+                    return
+                self._port_entry = FlatEntry(port_row_frame, textvariable=self._port_var)
+                self._port_entry.grid(row=0, column=0, sticky="ew", ipady=6)
+                self._port_var.set(current_val)
+            # else: already a plain entry, leave as-is
+
+    def _refresh_ports_now(self):
+        """Immediate rescan triggered by the ⟳ button."""
+        ports = self._scan_ports()
+        if ports != self._last_ports:
+            self._last_ports = ports
+            # Walk up to the form frame
+            try:
+                form_frame = self._port_status_lbl.master
+                self._rebuild_port_widget(form_frame, ports)
+            except Exception:
+                pass
+        self._update_port_status(ports)
+
+    def _poll_ports(self):
+        """Called repeatedly via after() while the dialog is open."""
+        if not self._polling:
+            return
+        try:
+            ports = self._scan_ports()
+            if ports != self._last_ports:
+                self._last_ports = ports
+                try:
+                    form_frame = self._port_status_lbl.master
+                    self._rebuild_port_widget(form_frame, ports)
+                except Exception:
+                    pass
+                self._update_port_status(ports)
+        except Exception:
+            pass
+        # Schedule next poll (only if the widget still exists)
+        try:
+            self._poll_id = self.after(self._PORT_POLL_MS, self._poll_ports)
+        except Exception:
+            pass
+
+    def destroy(self):
+        """Stop polling before closing."""
+        self._polling = False
+        try:
+            self.after_cancel(self._poll_id)
+        except Exception:
+            pass
+        super().destroy()
 
     def _save(self):
         vals = {k: v.get().strip() for k, v in self._vars.items()}
